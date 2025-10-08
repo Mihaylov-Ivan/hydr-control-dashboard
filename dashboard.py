@@ -30,9 +30,15 @@ from collections import deque
 
 import pandas as pd
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    def st_autorefresh(*_args, **_kwargs):
+        return None
 import plotly.express as px
 import plotly.graph_objects as go
+import dashboard_config as cfg
+import streamlit.components.v1 as components
 
 # Optional dependency for real WebSocket mode. Safe to import even if unused.
 try:
@@ -195,6 +201,46 @@ class WSClient:
 
 st.set_page_config(page_title="H2 / Power Dashboard", layout="wide")
 
+# Preserve scroll position across reruns for smoother UX
+components.html(
+    """
+<script>
+(function() {
+  const key = 'st-scroll-pos:' + (window.location.pathname || 'root');
+  function save() {
+    try { sessionStorage.setItem(key, String(window.scrollY || window.pageYOffset || 0)); } catch (e) {}
+  }
+  function getY() {
+    try { return parseInt(sessionStorage.getItem(key) || '0', 10) || 0; } catch (e) { return 0; }
+  }
+  function restore() {
+    const y = getY();
+    if (y >= 0) {
+      window.requestAnimationFrame(() => window.scrollTo(0, y));
+    }
+  }
+  try { history.scrollRestoration = 'manual'; } catch (e) {}
+  // Attempt restoration immediately and after layout settles
+  restore();
+  ;[50, 150, 300, 600, 1200, 2000].forEach(t => setTimeout(restore, t));
+  const start = Date.now();
+  const obs = new MutationObserver(() => {
+    if (Date.now() - start < 3000) {
+      restore();
+    } else {
+      obs.disconnect();
+    }
+  });
+  obs.observe(document.documentElement || document.body, { childList: true, subtree: true });
+  document.addEventListener('scroll', save, { passive: true });
+  window.addEventListener('beforeunload', save);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) setTimeout(restore, 100); });
+})();
+</script>
+    """,
+    height=0,
+)
+
 # Session state bootstrap with optimized defaults
 ss = st.session_state
 ss.setdefault("live_rows", [])           # list of flattened dicts with timestamp
@@ -210,76 +256,41 @@ ss.setdefault("last_mock_payload", None)
 ss.setdefault("chart_data_cache", None)  # Cache for chart data to prevent flashing
 ss.setdefault("last_chart_update", 0)    # Track last chart update time
 ss.setdefault("selected_fields", [])     # Cache selected fields
+ss.setdefault("last_ingest_time", 0.0)
 
-# Sidebar controls with performance optimizations
-st.sidebar.header("Feed & Window")
-mode = st.sidebar.selectbox("Data source", ["Mock", "WebSocket"], index=0, key="data_source")
-ss.mode = mode
+# Config-driven runtime (no sidebar)
+ss.mode = cfg.DATA_SOURCE
+ss.refresh_ms = cfg.REFRESH_MS
+ss.buffer_seconds = cfg.BUFFER_SECONDS
+ss.max_rows = cfg.MAX_ROWS
+ws_url = cfg.WS_URL if ss.mode == "WebSocket" else None
 
-if mode == "WebSocket":
-    ws_url = st.sidebar.text_input("WebSocket URL", value="ws://localhost:8000/stream", key="ws_url")
-    st.sidebar.caption("Messages must be JSON per-line/push.")
-else:
-    ws_url = None
+# Auto-rerun while page is open (uses config)
+if not getattr(cfg, "SMOOTH_UPDATES", False):
+    st_autorefresh(interval=ss.refresh_ms, key="_autorefresh")
 
-# Optimized refresh rate with better defaults
-refresh_presets = {
-    "Fast (250ms)": 250,
-    "Normal (500ms)": 500,
-    "Slow (1000ms)": 1000,
-    "Very Slow (2000ms)": 2000
-}
-refresh_preset = st.sidebar.selectbox("Refresh Speed", list(refresh_presets.keys()), index=1, key="refresh_preset")
-ss.refresh_ms = refresh_presets[refresh_preset]
-
-# Buffer settings with better organization
-st.sidebar.subheader("Data Management")
-buffer_seconds_input = st.sidebar.number_input("Live window (s)", min_value=10, max_value=3600, value=int(ss.buffer_seconds), step=10, key="buffer_seconds")
-max_rows_input = st.sidebar.number_input("Max rows (cap)", min_value=1000, max_value=200000, value=int(ss.max_rows), step=1000, key="max_rows")
-
-# Update session state only if values changed
-if buffer_seconds_input != ss.buffer_seconds:
-    ss.buffer_seconds = buffer_seconds_input
-if max_rows_input != ss.max_rows:
-    ss.max_rows = max_rows_input
-
-# Performance info
-st.sidebar.subheader("Performance")
-st.sidebar.metric("Live Data Points", len(ss.live_rows))
-st.sidebar.metric("Recorded Points", len(ss.recorded_rows))
-if ss.live_rows:
-    memory_usage = len(str(ss.live_rows)) / 1024 / 1024  # Rough estimate in MB
-    st.sidebar.metric("Memory Usage", f"{memory_usage:.1f} MB")
-
-# Auto-rerun while page is open
-st_autorefresh(interval=ss.refresh_ms, key="_autorefresh")
-
-# Top bar with optimized controls
-c1, c2, c3, c4, c5, c6 = st.columns([1,1,1,1,1,2])
-with c1:
-    if st.button("Start Recording", use_container_width=True, key="start_rec"):
-        ss.recording = True
-        ss.chart_data_cache = None  # Clear cache when starting recording
-with c2:
-    if st.button("Stop Recording", use_container_width=True, key="stop_rec"):
-        ss.recording = False
-with c3:
+# Sidebar controls
+with st.sidebar:
+    st.subheader("Controls")
+    btn_cols = st.columns([1,1])
+    with btn_cols[0]:
+        if st.button("Start Recording", use_container_width=True, key="start_rec"):
+            ss.recording = True
+            ss.chart_data_cache = None
+    with btn_cols[1]:
+        if st.button("Stop Recording", use_container_width=True, key="stop_rec"):
+            ss.recording = False
     if st.button("Clear Live", use_container_width=True, key="clear_live"):
         ss.live_rows = []
-        ss.chart_data_cache = None  # Clear cache when clearing data
-with c4:
+        ss.chart_data_cache = None
     if st.button("Clear Recorded", use_container_width=True, key="clear_rec"):
         ss.recorded_rows = []
-with c5:
-    # Build CSV for download with optimization
     if ss.recorded_rows:
-        # Only regenerate CSV if data has changed
         if not hasattr(ss, 'last_csv_data') or ss.last_csv_data != len(ss.recorded_rows):
             df_dl = pd.DataFrame(ss.recorded_rows)
             ss.csv_bytes = df_dl.to_csv(index=False).encode("utf-8")
             ss.csv_filename = f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             ss.last_csv_data = len(ss.recorded_rows)
-        
         st.download_button(
             "Export CSV",
             data=ss.csv_bytes,
@@ -290,13 +301,7 @@ with c5:
         )
     else:
         st.button("Export CSV", use_container_width=True, disabled=True, key="export_csv_disabled")
-with c6:
-    # Status with more information
-    status_color = "🟢" if ss.recording else "🔴"
-    mode_icon = "📡" if ss.mode == "WebSocket" else "🎭"
-    st.markdown(
-        f"**Status:** {status_color} {'Recording' if ss.recording else 'Stopped'}  |  **Mode:** {mode_icon} {ss.mode}  |  **Refresh:** {ss.refresh_ms}ms"
-    )
+# (Status line removed by request)
 
 # ----------------------------- Ingest step per rerun ----------------------------- #
 
@@ -365,177 +370,154 @@ else:
 
 # ----------------------------- Display ----------------------------- #
 
-left, right = st.columns([1, 2])
-
-with left:
-    st.subheader("Latest payload (raw)")
-    if ss.live_rows:
-        latest = ss.live_rows[-1].copy()
+if not ss.live_rows:
+    st.info("Waiting for data…")
+else:
+    # Use cached data if available and recent
+    current_time = time.time()
+    use_cache = (ss.chart_data_cache is not None and 
+                current_time - ss.last_chart_update < 2.0)  # Cache for 2 seconds
+    
+    if not use_cache:
+        # Process data only when needed
+        df = pd.DataFrame(ss.live_rows)
         
-        # Optimized nested structure reconstruction
-        nested = {
-            "timestamp": latest.pop("timestamp", None),
-            "ip": latest.pop("ip", None),
-            "device_info": {},
-            "em_status": {}
+        # Auto-detect numeric columns (prefer em_status.*)
+        numeric_cols = [
+            c for c in df.columns
+            if c not in ["timestamp", "epoch_time"] and pd.api.types.is_numeric_dtype(df[c])
+        ]
+        preferred = [c for c in numeric_cols if c.startswith("em_status.")]
+        default_sel = [c for c in preferred if any(x in c for x in ["c_voltage", "c_current", "total_aprt_power", "total_current"])]
+        
+        # Cache the processed data
+        ss.chart_data_cache = {
+            'df': df,
+            'numeric_cols': numeric_cols,
+            'preferred': preferred,
+            'default_sel': default_sel
         }
-        
-        # Efficiently group fields by prefix
-        for k, v in list(latest.items()):
-            if k.startswith("device_info.") and v is not None:
-                nested["device_info"][k.split(".", 1)[1]] = v
-            elif k.startswith("em_status.") and v is not None:
-                nested["em_status"][k.split(".", 1)[1]] = v
-        
-        # Use expandable JSON for better performance
-        with st.expander("View Raw JSON", expanded=True):
-            st.json(nested)
+        ss.last_chart_update = current_time
     else:
-        st.info("No data available")
+        # Use cached data
+        cache = ss.chart_data_cache
+        df = cache['df']
+        numeric_cols = cache['numeric_cols']
+        preferred = cache['preferred']
+        default_sel = cache['default_sel']
+    
+    # Field selection with persistence
+    if not ss.selected_fields:
+        ss.selected_fields = default_sel[:4] if default_sel else (preferred[:3] if preferred else numeric_cols[:3])
+    
+    sel = st.multiselect(
+        "Fields to plot",
+        options=preferred or numeric_cols,
+        default=ss.selected_fields,
+        key="field_selector"
+    )
+    
+    # Update cached selection
+    ss.selected_fields = sel
 
-    st.markdown("---")
-    # Performance metrics
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Live Samples", len(ss.live_rows))
-    with col2:
-        st.metric("Recorded Samples", len(ss.recorded_rows))
+    # Display mode: Separate vs Overlay (default Separate)
+    display_mode = st.radio(
+        "Display mode",
+        ["Separate", "Overlay"],
+        index=(0 if cfg.DEFAULT_DISPLAY_MODE == "Separate" else 1),
+        horizontal=True,
+        key="chart_display_mode",
+    )
 
-with right:
-    st.subheader("Live charts")
-    if not ss.live_rows:
-        st.info("Waiting for data…")
-    else:
-        # Use cached data if available and recent
-        current_time = time.time()
-        use_cache = (ss.chart_data_cache is not None and 
-                    current_time - ss.last_chart_update < 2.0)  # Cache for 2 seconds
-        
-        if not use_cache:
-            # Process data only when needed
-            df = pd.DataFrame(ss.live_rows)
-            
-            # Auto-detect numeric columns (prefer em_status.*)
-            numeric_cols = [
-                c for c in df.columns
-                if c not in ["timestamp", "epoch_time"] and pd.api.types.is_numeric_dtype(df[c])
-            ]
-            preferred = [c for c in numeric_cols if c.startswith("em_status.")]
-            default_sel = [c for c in preferred if any(x in c for x in ["c_voltage", "c_current", "total_aprt_power", "total_current"])]
-            
-            # Cache the processed data
-            ss.chart_data_cache = {
-                'df': df,
-                'numeric_cols': numeric_cols,
-                'preferred': preferred,
-                'default_sel': default_sel
-            }
-            ss.last_chart_update = current_time
-        else:
-            # Use cached data
-            cache = ss.chart_data_cache
-            df = cache['df']
-            numeric_cols = cache['numeric_cols']
-            preferred = cache['preferred']
-            default_sel = cache['default_sel']
-        
-        # Field selection with persistence
-        if not ss.selected_fields:
-            ss.selected_fields = default_sel[:4] if default_sel else (preferred[:3] if preferred else numeric_cols[:3])
-        
-        sel = st.multiselect(
-            "Fields to plot",
-            options=preferred or numeric_cols,
-            default=ss.selected_fields,
-            key="field_selector"
-        )
-        
-        # Update cached selection
-        ss.selected_fields = sel
+    # Convert time and plot with stable rendering
+    if sel:
+        # Create a stable chart container
+        charts_placeholder = st.empty()
 
-        # Convert time and plot with stable rendering
-        if sel:
-            # Create a stable chart container
-            chart_container = st.container()
-            with chart_container:
-                # Convert timestamp only for selected data
-                df_plot = df[["timestamp"] + sel].copy()
-                df_plot["timestamp"] = pd.to_datetime(df_plot["timestamp"], errors="coerce")
-                
-                # Remove any rows with invalid timestamps
-                df_plot = df_plot.dropna(subset=["timestamp"])
-                
-                if len(df_plot) > 0:
-                    # Set timestamp as index for proper time series plotting
-                    df_plot = df_plot.set_index("timestamp")
-                    
-                    # Debug info for single field
-                    if len(sel) == 1:
-                        field_name = sel[0]
-                        st.caption(f"Plotting {field_name} with {len(df_plot)} data points")
-                        # Show sample data for debugging
-                        if len(df_plot) > 0:
-                            values = df_plot[field_name].tolist()
-                            st.caption(f"Sample values: {values[:3]}")
-                            st.caption(f"Value range: {min(values):.6f} to {max(values):.6f}")
-                            
-                            # Check if values are all the same (which might cause display issues)
-                            if len(set(values)) == 1:
-                                st.warning(f"All values are the same: {values[0]}")
-                            elif max(values) - min(values) < 0.001:
-                                st.warning(f"Very small value range: {max(values) - min(values):.6f}")
-                    
-                    # Try different charting approaches for better visibility
-                    if len(sel) == 1:
-                        # For single field, use Plotly for better handling of small values
-                        field_name = sel[0]
-                        chart_data = df_plot[[field_name]].copy()
-                        
-                        # Ensure we have numeric data
-                        if pd.api.types.is_numeric_dtype(chart_data[field_name]):
-                            # Reset index to get timestamp as a column
-                            chart_data_reset = chart_data.reset_index()
-                            
-                            # Create Plotly figure with better scaling
-                            fig = px.line(
-                                chart_data_reset, 
-                                x='timestamp', 
-                                y=field_name,
-                                title=f'{field_name} over time',
-                                height=400
-                            )
-                            
-                            # Improve visibility for small values
-                            fig.update_layout(
-                                yaxis=dict(
-                                    type='linear',
-                                    showgrid=True,
-                                    zeroline=True
-                                ),
-                                xaxis=dict(
-                                    showgrid=True
-                                )
-                            )
-                            
-                            st.plotly_chart(fig, use_container_width=True)
-                        else:
-                            st.error(f"Field {field_name} is not numeric")
-                    else:
-                        # For multiple fields, use the original approach
-                        st.line_chart(df_plot, height=400)
-                else:
+        def render_charts_from_rows(rows: List[Dict[str, Any]]):
+            with charts_placeholder.container():
+                df_local = pd.DataFrame(rows)
+                df_local = df_local[["timestamp"] + sel].copy()
+                df_local["timestamp"] = pd.to_datetime(df_local["timestamp"], errors="coerce")
+                df_local = df_local.dropna(subset=["timestamp"]) 
+                if len(df_local) == 0:
                     st.info("No valid data points available for plotting")
-        else:
-            st.info("Select at least one numeric field.")
+                    return
+                df_local = df_local.set_index("timestamp")
+                # Light decimation when many points present
+                if len(df_local) > 1200:
+                    stride = max(1, len(df_local) // 300)
+                    df_local = df_local.iloc[::stride]
+                if display_mode == "Overlay" and len(sel) > 0:
+                    df_reset = df_local.reset_index()
+                    df_melt = df_reset.melt(
+                        id_vars="timestamp",
+                        value_vars=sel,
+                        var_name="field",
+                        value_name="value",
+                    )
+                    fig = px.line(
+                        df_melt,
+                        x="timestamp",
+                        y="value",
+                        color="field",
+                        title="Selected fields",
+                        height=400,
+                    )
+                    fig.update_layout(
+                        yaxis=dict(type="linear", showgrid=True, zeroline=True),
+                        xaxis=dict(showgrid=True),
+                        uirevision="keep",  # preserve zoom/viewport
+                        transition=dict(duration=200),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    for field_name in sel:
+                        chart_data_reset = df_local[[field_name]].reset_index()
+                        fig = px.line(
+                            chart_data_reset,
+                            x="timestamp",
+                            y=field_name,
+                            title=f"{field_name} over time",
+                            height=300,
+                        )
+                        fig.update_layout(
+                            yaxis=dict(type="linear", showgrid=True, zeroline=True),
+                            xaxis=dict(showgrid=True),
+                            uirevision="keep",
+                            transition=dict(duration=200),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
 
-# Footer with performance tips
-st.markdown("---")
-st.markdown(
-    """
-    ### 💡 Performance Tips:
-    - Use **Normal (500ms)** refresh rate for best balance of performance and responsiveness
-    - Reduce **Live window** size if you experience memory issues
-    - Clear data periodically to maintain optimal performance
-    - **WebSocket mode** is available for real-time data ingestion
-    """
-)
+        if getattr(cfg, "SMOOTH_UPDATES", False):
+            end_time = time.time() + getattr(cfg, "SMOOTH_BURST_SECONDS", 6)
+            sleep_s = max(0.05, ss.refresh_ms / 1000.0)
+            ingest_interval = max(0.1, getattr(cfg, "INGEST_INTERVAL_S", 2.0))
+            while time.time() < end_time:
+                now = time.time()
+                if now - ss.last_ingest_time >= ingest_interval:
+                    if ss.mode == "Mock":
+                        p = mock_payload(ss.last_mock_payload)
+                        append_row_from_payload(p)
+                        ss.last_mock_payload = p
+                    else:
+                        pulls = 0
+                        while ss.ws_queue and pulls < 100:
+                            _ts, msg = ss.ws_queue.popleft()
+                            append_row_from_payload(msg)
+                            pulls += 1
+                    ss.last_ingest_time = now
+                    render_charts_from_rows(ss.live_rows)
+                time.sleep(sleep_s)
+            # continue updating seamlessly
+            try:
+                st.rerun()
+            except Exception:
+                st.experimental_rerun()  # type: ignore
+        else:
+            # One-shot render (legacy mode)
+            render_charts_from_rows(ss.live_rows)
+    else:
+        st.info("Select at least one numeric field.")
+
+# (Performance tips removed by request)
